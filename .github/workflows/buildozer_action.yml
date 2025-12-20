@@ -13,6 +13,18 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    # ✅ FORCE JAVA 17 (MOST IMPORTANT STEP)
+    - name: Setup Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+
+    - name: Verify Java version
+      run: |
+        java -version
+        echo "JAVA_HOME=$JAVA_HOME"
+
     - name: Install system dependencies
       run: |
         sudo apt update
@@ -20,7 +32,6 @@ jobs:
           build-essential \
           git \
           zip unzip \
-          openjdk-17-jdk \
           libffi-dev \
           libssl-dev \
           zlib1g-dev \
