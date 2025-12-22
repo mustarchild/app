@@ -3,204 +3,198 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.uix.textinput import TextInput
 from kivy.uix.gridlayout import GridLayout
-from kivy.clock import Clock
 from kivy.uix.progressbar import ProgressBar
 from kivy.uix.button import Button
 from kivy.uix.screenmanager import ScreenManager, Screen
+from kivy.clock import Clock
 
-import asyncio
+from jnius import autoclass
 import threading
-from bleak import BleakClient
 
+# ================= ANDROID BLUETOOTH =================
+BluetoothAdapter = autoclass('android.bluetooth.BluetoothAdapter')
+BluetoothDevice = autoclass('android.bluetooth.BluetoothDevice')
+UUID = autoclass('java.util.UUID')
+InputStreamReader = autoclass('java.io.InputStreamReader')
+BufferedReader = autoclass('java.io.BufferedReader')
+OutputStreamWriter = autoclass('java.io.OutputStreamWriter')
 
-# ================= BLE CONFIG =================
-BLE_ADDRESS = "AA:BB:CC:DD:EE:FF"   # 🔴 CHANGE THIS
-BLE_CHAR_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"  # 🔴 CHANGE THIS
+HC06_NAME = "HC-06"
+SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
-
-# ================= SHARED BMS DATA =================
+# ================= SHARED DATA =================
 bms_data = {
-    "pack_voltage": 0.0,
-    "pack_current": 0.0,
-    "pack_temp": 0.0,
-    "soc": 0.0,
+    "V": 0.0,
+    "I": 0.0,
+    "T": 0.0,
+    "SOC": 0.0,
     "cells": [0.0] * 16
 }
 
+params_data = {
+    "UV": 2.8,
+    "OV": 4.2,
+    "UC": -50,
+    "OC": 100
+}
 
-# ================= BLE HANDLER =================
-def parse_ble_data(data: str):
-    """
-    Expected:
-    V=56.2,I=12.4,T=32.1,SOC=78,C1=3.65,...,C16=3.67
-    """
+bt_writer = None
+
+# ================= PARSER =================
+def parse_data(line):
     try:
-        parts = data.split(",")
-
-        for part in parts:
-            if "=" not in part:
-                continue
-
-            key, val = part.split("=")
-
-            if key == "V":
-                bms_data["pack_voltage"] = float(val)
-            elif key == "I":
-                bms_data["pack_current"] = float(val)
-            elif key == "T":
-                bms_data["pack_temp"] = float(val)
-            elif key == "SOC":
-                bms_data["soc"] = float(val)
-            elif key.startswith("C"):
-                idx = int(key[1:]) - 1
+        parts = line.split(",")
+        for p in parts:
+            k, v = p.split("=")
+            if k == "V": bms_data["V"] = float(v)
+            elif k == "I": bms_data["I"] = float(v)
+            elif k == "T": bms_data["T"] = float(v)
+            elif k == "SOC": bms_data["SOC"] = float(v)
+            elif k.startswith("C"):
+                idx = int(k[1:]) - 1
                 if 0 <= idx < 16:
-                    bms_data["cells"][idx] = float(val)
+                    bms_data["cells"][idx] = float(v)
     except:
         pass
 
+# ================= BLUETOOTH THREAD =================
+def bluetooth_thread():
+    global bt_writer
+    adapter = BluetoothAdapter.getDefaultAdapter()
 
-async def ble_task():
-    async with BleakClient(BLE_ADDRESS) as client:
-        print("BLE Connected")
+    device = None
+    for d in adapter.getBondedDevices().toArray():
+        if d.getName() == HC06_NAME:
+            device = d
+            break
 
-        def notification_handler(sender, data):
-            text = data.decode(errors="ignore")
-            parse_ble_data(text)
+    if device is None:
+        print("HC-06 not paired")
+        return
 
-        await client.start_notify(BLE_CHAR_UUID, notification_handler)
+    socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
+    socket.connect()
 
-        while True:
-            await asyncio.sleep(1)
+    reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+    bt_writer = OutputStreamWriter(socket.getOutputStream())
 
+    while True:
+        line = reader.readLine()
+        if line:
+            parse_data(line)
 
-def start_ble_loop():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(ble_task())
+def send_params():
+    if bt_writer:
+        msg = f"UV={params_data['UV']},OV={params_data['OV']}," \
+              f"UC={params_data['UC']},OC={params_data['OC']}\n"
+        bt_writer.write(msg)
+        bt_writer.flush()
 
-
-# ================= DASHBOARD SCREEN =================
-class DashboardScreen(Screen):
-
+# ================= DASHBOARD =================
+class Dashboard(Screen):
     def build_ui(self):
-        main = BoxLayout(orientation='vertical', padding=10, spacing=10)
+        root = BoxLayout(orientation="vertical", padding=10, spacing=10)
 
-        top = BoxLayout(size_hint_y=None, height=75, spacing=10)
-
-        btn = Button(text="Set Parameters", size_hint=(None, None),
-                     size=(200, 75), font_size=20)
-        btn.bind(on_press=self.goto_params)
-
-        title = Label(text="16S BMS DASHBOARD", font_size=34, bold=True)
-
+        top = BoxLayout(size_hint_y=None, height=70)
+        btn = Button(text="Set Parameters", size_hint=(None, None), size=(200, 70))
+        btn.bind(on_press=lambda x: setattr(self.manager, "current", "params"))
         top.add_widget(btn)
-        top.add_widget(title)
-        main.add_widget(top)
+        top.add_widget(Label(text="16S BMS DASHBOARD", font_size=32))
+        root.add_widget(top)
 
-        def param(name):
-            box = BoxLayout(size_hint_y=None, height=55)
-            lbl = Label(text=name, font_size=18, bold=True)
-            ti = TextInput(readonly=True, font_size=26, text="0.0")
-            box.add_widget(lbl)
-            box.add_widget(ti)
-            main.add_widget(box)
-            return ti
+        def row(name):
+            b = BoxLayout(size_hint_y=None, height=50)
+            b.add_widget(Label(text=name))
+            t = TextInput(readonly=True)
+            b.add_widget(t)
+            root.add_widget(b)
+            return t
 
-        self.pack_voltage = param("Pack Voltage (V)")
-        self.pack_current = param("Pack Current (A)")
-        self.pack_temp = param("Temperature (°C)")
-        self.pack_soc = param("State of Charge (%)")
+        self.v = row("Voltage")
+        self.i = row("Current")
+        self.t = row("Temperature")
+        self.soc = row("SOC")
 
-        self.soc_bar = ProgressBar(max=100, size_hint_y=None, height=25)
-        main.add_widget(self.soc_bar)
+        self.bar = ProgressBar(max=100, size_hint_y=None, height=25)
+        root.add_widget(self.bar)
 
         grid = GridLayout(cols=2, spacing=10, size_hint_y=None)
-        grid.bind(minimum_height=grid.setter('height'))
-        self.cell_inputs = []
+        grid.bind(minimum_height=grid.setter("height"))
+        self.cells = []
 
         for i in range(16):
-            box = BoxLayout(size_hint_y=None, height=50)
-            lbl = Label(text=f"Cell {i+1}", font_size=16)
-            ti = TextInput(readonly=True, font_size=22, text="0.000")
-            box.add_widget(lbl)
-            box.add_widget(ti)
-            grid.add_widget(box)
-            self.cell_inputs.append(ti)
+            b = BoxLayout(size_hint_y=None, height=45)
+            b.add_widget(Label(text=f"Cell {i+1}"))
+            ti = TextInput(readonly=True)
+            b.add_widget(ti)
+            grid.add_widget(b)
+            self.cells.append(ti)
 
-        main.add_widget(grid)
-        self.add_widget(main)
+        root.add_widget(grid)
+        self.add_widget(root)
 
-        Clock.schedule_interval(self.update_ui, 0.5)
+        Clock.schedule_interval(self.update_ui, 0.3)
 
     def update_ui(self, dt):
-        self.pack_voltage.text = str(bms_data["pack_voltage"])
-        self.pack_current.text = str(bms_data["pack_current"])
-        self.pack_temp.text = str(bms_data["pack_temp"])
-        self.pack_soc.text = str(bms_data["soc"])
-        self.soc_bar.value = bms_data["soc"]
+        self.v.text = f"{bms_data['V']:.2f}"
+        self.i.text = f"{bms_data['I']:.2f}"
+        self.t.text = f"{bms_data['T']:.1f}"
+        self.soc.text = f"{bms_data['SOC']:.1f}"
+        self.bar.value = bms_data["SOC"]
 
         for i in range(16):
-            self.cell_inputs[i].text = str(bms_data["cells"][i])
+            self.cells[i].text = f"{bms_data['cells'][i]:.3f}"
 
-    def goto_params(self, instance):
-        self.manager.current = "params"
-
-
-# ================= PARAMETERS SCREEN =================
-class ParamsScreen(Screen):
-
+# ================= PARAMETERS =================
+class Params(Screen):
     def build_ui(self):
-        root = BoxLayout(orientation='vertical', padding=20, spacing=15)
+        root = BoxLayout(orientation="vertical", padding=20, spacing=15)
 
-        root.add_widget(Label(text="BMS Protection Parameters",
-                              font_size=30, bold=True,
-                              size_hint_y=None, height=50))
+        root.add_widget(Label(text="Set Protection Parameters",
+                              font_size=28, size_hint_y=None, height=50))
 
-        self.param(root, "Under Voltage (V)", 2.8)
-        self.param(root, "Over Voltage (V)", 4.2)
-        self.param(root, "Under Current (A)", -50)
-        self.param(root, "Over Current (A)", 100)
+        self.inputs = {}
 
-        btn = Button(text="Back to Dashboard", size_hint_y=None,
-                     height=65, font_size=22)
-        btn.bind(on_press=self.goto_dashboard)
-        root.add_widget(btn)
+        def param(name, key):
+            b = BoxLayout(size_hint_y=None, height=60)
+            b.add_widget(Label(text=name))
+            ti = TextInput(text=str(params_data[key]), multiline=False)
+            self.inputs[key] = ti
+            b.add_widget(ti)
+            root.add_widget(b)
+
+        param("Under Voltage", "UV")
+        param("Over Voltage", "OV")
+        param("Under Current", "UC")
+        param("Over Current", "OC")
+
+        save = Button(text="Save & Send", size_hint_y=None, height=65)
+        save.bind(on_press=self.save)
+        root.add_widget(save)
+
+        back = Button(text="Back", size_hint_y=None, height=65)
+        back.bind(on_press=lambda x: setattr(self.manager, "current", "dash"))
+        root.add_widget(back)
 
         root.add_widget(Label(size_hint_y=1))
         self.add_widget(root)
 
-    def param(self, parent, name, default):
-        box = BoxLayout(size_hint_y=None, height=60)
-        box.add_widget(Label(text=name, font_size=18))
-        box.add_widget(TextInput(text=str(default),
-                                 font_size=24,
-                                 multiline=False))
-        parent.add_widget(box)
-
-    def goto_dashboard(self, instance):
-        self.manager.current = "dashboard"
-
+    def save(self, instance):
+        for k in self.inputs:
+            params_data[k] = float(self.inputs[k].text)
+        send_params()
 
 # ================= APP =================
 class BMSApp(App):
-
     def build(self):
-        # Start BLE thread
-        threading.Thread(target=start_ble_loop, daemon=True).start()
+        threading.Thread(target=bluetooth_thread, daemon=True).start()
 
         sm = ScreenManager()
-
-        dash = DashboardScreen(name="dashboard")
-        dash.build_ui()
-
-        params = ParamsScreen(name="params")
-        params.build_ui()
-
-        sm.add_widget(dash)
-        sm.add_widget(params)
-
+        d = Dashboard(name="dash"); d.build_ui()
+        p = Params(name="params"); p.build_ui()
+        sm.add_widget(d)
+        sm.add_widget(p)
         return sm
-
 
 if __name__ == "__main__":
     BMSApp().run()
